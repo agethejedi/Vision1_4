@@ -1,8 +1,11 @@
+// Vision risk worker — imports adapter with cache-bust and exposes VisionConfig in worker scope
+
 import { scoreOne, scoreBatch } from '../shared/risk-core/index.js';
-import { RiskAdapters } from '../adapters/evm.js'; // import adapter INSIDE the worker
+// Cache-bust to force browsers/CDNs to fetch the latest adapter (uses /txs + /ofac)
+import { RiskAdapters } from '../adapters/evm.js?v=txs-2025-11-02';
 
 let ctx = {
-  adapters: { evm: RiskAdapters.evm }, // keep adapter here (don’t pass from main thread)
+  adapters: { evm: RiskAdapters.evm }, // keep adapter inside worker (avoid DataCloneError)
   cache: null,
   network: 'eth',
   ruleset: 'safesend-2025.10.1',
@@ -15,12 +18,13 @@ self.onmessage = async (e) => {
   try {
     if (type === 'INIT') {
       const { adapters: _ignored, apiBase, ...rest } = payload || {};
-      // Keep our adapter, merge other settings
       ctx = { ...ctx, ...rest };
-      // Provide VisionConfig to the worker scope for the adapter to read
+
+      // Make API_BASE available inside worker for the adapter (no window in workers)
       if (apiBase) {
         self.VisionConfig = Object.assign({}, self.VisionConfig || {}, { API_BASE: apiBase });
       }
+
       postMessage({
         id,
         type: 'INIT_OK',
@@ -47,7 +51,11 @@ self.onmessage = async (e) => {
       return;
     }
 
-    if (type === 'ABORT') { postMessage({ id, type: 'ABORT_ACK' }); return; }
+    if (type === 'ABORT') {
+      postMessage({ id, type: 'ABORT_ACK' });
+      return;
+    }
+
   } catch (err) {
     postMessage({ id, type: 'ERROR', error: String(err?.message || err) });
   }

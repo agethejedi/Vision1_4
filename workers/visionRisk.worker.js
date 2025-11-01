@@ -1,62 +1,98 @@
-// Vision risk worker — imports adapter with cache-bust and exposes VisionConfig in worker scope
+// workers/visionRisk.worker.js
+// Minimal worker: server-policy aware scoring (+ optional streaming)
 
-import { scoreOne, scoreBatch } from '../shared/risk-core/index.js';
-// Cache-bust to force browsers/CDNs to fetch the latest adapter (uses /txs + /ofac)
-import { RiskAdapters } from '../adapters/evm.js?v=txs-2025-11-02';
-
-let ctx = {
-  adapters: { evm: RiskAdapters.evm }, // keep adapter inside worker (avoid DataCloneError)
-  cache: null,
-  network: 'eth',
-  ruleset: 'safesend-2025.10.1',
+let CFG = {
+  apiBase: "",
+  network: "eth",
   concurrency: 8,
-  flags: { graphSignals: true, streamBatch: true }
+  flags: { graphSignals: true, streamBatch: true },
 };
 
 self.onmessage = async (e) => {
   const { id, type, payload } = e.data || {};
   try {
     if (type === 'INIT') {
-      const { adapters: _ignored, apiBase, ...rest } = payload || {};
-      ctx = { ...ctx, ...rest };
-
-      // Make API_BASE available inside worker for the adapter (no window in workers)
-      if (apiBase) {
-        self.VisionConfig = Object.assign({}, self.VisionConfig || {}, { API_BASE: apiBase });
-      }
-
-      postMessage({
-        id,
-        type: 'INIT_OK',
-        capabilities: ['single', 'batch', 'stream', 'graphSignals'],
-        ruleset: ctx.ruleset
-      });
+      if (payload?.apiBase) CFG.apiBase = String(payload.apiBase).replace(/\/$/, '');
+      if (payload?.network) CFG.network = payload.network;
+      if (payload?.concurrency) CFG.concurrency = payload.concurrency;
+      if (payload?.flags) CFG.flags = { ...CFG.flags, ...payload.flags };
+      post({ id, type: 'INIT_OK' });
       return;
     }
 
     if (type === 'SCORE_ONE') {
-      const res = await scoreOne(payload.item, ctx);
-      postMessage({ id, type: 'RESULT', data: res });
+      const item = payload?.item;
+      const res = await scoreOne(item);
+      post({ id, type: 'RESULT', data: res });
       return;
     }
 
     if (type === 'SCORE_BATCH') {
-      const results = await scoreBatch(payload.items, ctx);
-      if (ctx.flags.streamBatch) {
-        for (const r of results) postMessage({ id, type: 'RESULT_STREAM', data: r });
-        postMessage({ id, type: 'DONE' });
-      } else {
-        postMessage({ id, type: 'RESULT', data: results });
+      const items = Array.isArray(payload?.items) ? payload.items : [];
+      for (const it of items) {
+        const r = await scoreOne(it);
+        post({ type: 'RESULT_STREAM', data: r });
       }
+      post({ id, type: 'DONE' });
       return;
     }
 
-    if (type === 'ABORT') {
-      postMessage({ id, type: 'ABORT_ACK' });
-      return;
-    }
-
+    throw new Error(`unknown type: ${type}`);
   } catch (err) {
-    postMessage({ id, type: 'ERROR', error: String(err?.message || err) });
+    post({ id, type: 'ERROR', error: String(err?.message || err) });
   }
 };
+
+function post(msg){ self.postMessage(msg); }
+
+// ---- Core scoring (server-policy aware) ----------------------------------
+
+async function scoreOne(item) {
+  const id = item?.id || item?.address || '';
+  const network = item?.network || CFG.network || 'eth';
+  if (!id) throw new Error('scoreOne: missing id');
+
+  // 1) Ask server worker for list hits / policy
+  let policy = null;
+  try {
+    const url = `${CFG.apiBase}/check?address=${encodeURIComponent(id)}&network=${encodeURIComponent(network)}`;
+    const r = await fetch(url, { headers:{ 'accept':'application/json' }, cf: { cacheTtl: 0 } }).catch(()=>null);
+    if (r && r.ok) policy = await r.json();
+  } catch(_){ /* ignore network errors */ }
+
+  // 2) Local heuristic score (keep your current 55 default)
+  let localScore = 55;                 // ← your existing mid score
+  let localReasons = ['No elevated factors detected'];
+
+  // 3) Merge: trust server on block / score 100 / reasons
+  const blocked = !!(policy?.block || policy?.risk_score === 100);
+  const mergedScore = blocked ? 100 : (typeof policy?.risk_score === 'number' ? policy.risk_score : localScore);
+  const reasons = (policy?.reasons && policy.reasons.length) ? policy.reasons
+                 : (policy?.risk_factors && policy.risk_factors.length) ? policy.risk_factors
+                 : localReasons;
+
+  // 4) Return unified result shape
+  return {
+    type: 'address',
+    id,
+    address: id,
+    network,
+    label: id.slice(0, 10) + '…',
+    // policy
+    block: blocked,
+    risk_score: mergedScore,
+    reasons,
+    risk_factors: reasons,
+
+    // legacy fields used by app.js
+    score: mergedScore,
+    explain: { reasons, blocked },
+
+    // dummy feature slots (safe defaults)
+    feats: {
+      ageDays:  (policy?.feats?.ageDays ?? 0),
+      mixerTaint: (policy?.feats?.mixerTaint ?? 0),
+      local: { riskyNeighborRatio: 0 },
+    },
+  };
+}

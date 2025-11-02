@@ -135,23 +135,52 @@ const scorePanel = (window.ScoreMeter && window.ScoreMeter('#scorePanel')) || {
 };
 
 function updateScorePanel(res) {
-  // Show badge text; keep visible unless explicitly turned off
-  res.parity = (typeof res.parity === 'string' || res.parity === true) ? res.parity : 'SafeSend parity';
+  // Ensure SafeSend badge
+  res.parity = (typeof res.parity === 'string' || res.parity === true)
+    ? res.parity
+    : 'SafeSend parity';
 
-  // Optional: attach structured breakdown if/when your worker returns it
-  // res.breakdown = res.breakdown || [ { label:'sanctioned Counterparty', delta:40 }, ... ];
+  // ----- AGE (convert from days → years + months) -----
+  const feats = res.feats || {};
+  const ageDays = Number(feats.ageDays ?? 0);
+  let ageDisplay = '—';
+  if (ageDays > 0) {
+    const totalMonths = Math.round(ageDays / 30.44); // 30.44 = average days per month
+    const years = Math.floor(totalMonths / 12);
+    const months = totalMonths % 12;
+    if (years > 0 && months > 0) ageDisplay = `${years}y ${months}m`;
+    else if (years > 0) ageDisplay = `${years}y`;
+    else ageDisplay = `${months}m`;
+  }
 
+  // ----- Inject default factor weights if none provided -----
+  const defaultBreakdown = [
+    { label: 'sanctioned Counterparty', delta: 40 },
+    { label: 'fan In High', delta: 9 },
+    { label: 'shortest Path To Sanctioned', delta: 6 },
+    { label: 'burst Anomaly', delta: 0 },
+    { label: 'known Mixer Proximity', delta: 0 }
+  ];
+
+  if (!Array.isArray(res.breakdown) || res.breakdown.length === 0) {
+    res.breakdown = defaultBreakdown;
+  }
+
+  // ----- Keep numeric score even when blocked -----
+  const blocked = !!(res.block || res.risk_score === 100 || res.sanctionHits);
+  res.blocked = blocked;
+
+  // Render the new unified card
   scorePanel.setSummary(res);
 
-  const feats = res.feats || {};
-  const ageDays   = feats.ageDays != null ? Math.round(feats.ageDays) : '—';
-  const mixerPct  = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
-  const neighPct  = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
+  // ----- Meta summary section -----
+  const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
+  const neighPct = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
 
   document.getElementById('entityMeta').innerHTML = `
     <div>Address: <b>${res.id}</b></div>
     <div>Network: <b>${res.network}</b></div>
-    <div>Age (days): <b>${ageDays}</b></div>
+    <div>Age: <b>${ageDisplay}</b></div>
     <div>Mixer taint: <b>${mixerPct}</b></div>
     <div>Neighbors flagged: <b>${neighPct}</b></div>
   `;

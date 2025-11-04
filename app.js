@@ -1,15 +1,12 @@
-// app.js — Vision 1.3 (Narratives + Neighbor Visuals)
-// ----------------------------------------------------
 import './ui/ScoreMeter.js?v=2025-11-02';     // provides window.ScoreMeter(...)
 import './graph.js?v=2025-11-02';             // provides window.graph (on/setData/setHalo)
 
-/* ================= Feature Flags ==================== */
+/* ================= RXL FLAGS (safe defaults) ==================== */
 const RXL_FLAGS = Object.freeze({
-  enableNarrative: true,         // Narrative Summary panel
-  enableNeighborVisuals: true,   // Expand 1-hop, highlight neighbors, refocus
+  enableNarrative: true  // flip false to hide Narrative panel entirely
 });
 
-/* ================= Worker plumbing ================== */
+/* ================= Worker plumbing ============================== */
 const worker = new Worker('./workers/visionRisk.worker.js', { type: 'module' });
 
 const pending = new Map();
@@ -42,7 +39,6 @@ worker.onmessage = (e) => {
   }
 
   if (type === 'RESULT') {
-    // Generic RESULT (SCORE_ONE/BATCH return here), or custom calls can reuse it
     const r = normalizeResult(data);
     drawHalo(r);
     if (r.id === selectedNodeId) {
@@ -68,14 +64,14 @@ worker.onmessage = (e) => {
 
 /* ================ Result normalization ========================== */
 function normalizeResult(res = {}) {
-  // Prefer server risk_score; fall back to res.score
+  // Prefer server risk_score (100 on OFAC), else fallback to res.score
   const serverScore = (typeof res.risk_score === 'number') ? res.risk_score : null;
   const score = (serverScore != null) ? serverScore : (typeof res.score === 'number' ? res.score : 0);
 
-  // Blocked if server says so, or risk_score=100, or explicit sanction hit
+  // Blocked if server says block, or risk_score=100, or explicit sanction hit
   const blocked = !!(res.block || serverScore === 100 || res.sanctionHits);
 
-  // Preserve/prepare explain
+  // Preserve upstream explain or create a shell
   const explain = res.explain && typeof res.explain === 'object'
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
@@ -83,7 +79,7 @@ function normalizeResult(res = {}) {
   // Robust OFAC boolean for UI/badges
   coerceOfacFlag(explain, res);
 
-  // Wallet age risk fallback (younger = riskier)
+  // Wallet age risk (fallback from feats.ageDays → 0..1; younger = riskier)
   if (typeof explain.walletAgeRisk !== 'number') {
     const days = Number(res.feats?.ageDays ?? NaN);
     if (!Number.isNaN(days) && days >= 0) {
@@ -91,7 +87,7 @@ function normalizeResult(res = {}) {
     }
   }
 
-  // Neighbor proxies if native fields absent (safe no-ops if missing)
+  // Map any neighbor proxies if native fields absent
   if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     explain.neighborsDormant = {
@@ -126,7 +122,7 @@ async function init() {
     network: getNetwork(),
     ruleset: 'safesend-2025.10.1',
     concurrency: 8,
-    flags: { graphSignals: true, streamBatch: true, neighborStats: true } // safe if ignored
+    flags: { graphSignals: true, streamBatch: true, neighborStats: true } // neighborStats is safe if worker ignores it
   });
 
   bindUI();
@@ -141,7 +137,7 @@ function bindUI() {
   });
 
   document.getElementById('clearBtn')?.addEventListener('click', () => {
-    setGraphData({ nodes: [], links: [] });
+    window.graph?.setData({ nodes: [], links: [] });
     updateBatchStatus('Idle');
     setSelected(null);
     hideNarrativePanel();
@@ -167,57 +163,34 @@ function bindUI() {
         const rr = normalizeResult(r);
         updateScorePanel(rr);
         renderNarrativePanelIfEnabled(rr);
-        if (RXL_FLAGS.enableNeighborVisuals) {
-          expandNeighbors(n.id).catch(()=>{});
-        }
       })
       .catch(() => {});
   });
 
-  // Narrative UI actions (exist only if panel is present)
+  // Narrative UI actions (exist only if panel is present in index.html)
   const modeSel = document.getElementById('rxlMode');
-  if (modeSel) modeSel.addEventListener('change', () => {
-    if (lastRenderResult) renderNarrativePanelIfEnabled(lastRenderResult);
-  });
+  if (modeSel) {
+    modeSel.addEventListener('change', () => {
+      if (lastRenderResult) renderNarrativePanelIfEnabled(lastRenderResult);
+    });
+  }
   const copyBtn = document.getElementById('rxlCopy');
-  if (copyBtn) copyBtn.addEventListener('click', async () => {
-    const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
-    try { await navigator.clipboard.writeText(txt); flash(copyBtn, 'Copied!'); } catch {}
-  });
+  if (copyBtn) {
+    copyBtn.addEventListener('click', async () => {
+      const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
+      try {
+        await navigator.clipboard.writeText(txt);
+        flash(copyBtn, 'Copied!');
+      } catch {}
+    });
+  }
   const exportBtn = document.getElementById('rxlExport');
-  if (exportBtn) exportBtn.addEventListener('click', () => {
-    // exportRiskNarrativePDF({ result: lastRenderResult, narrative: document.getElementById('rxlNarrativeText')?.textContent || '' });
-    flash(exportBtn, 'Queued');
-  });
-
-  // --- Neighbor Visual Controls (auto-injected; no HTML changes needed) ---
-  if (RXL_FLAGS.enableNeighborVisuals) {
-    const graphPanelRow = document.querySelector('.left .panel .panel-row');
-    if (graphPanelRow && !document.getElementById('btnExpandNeighbors')) {
-      const expandBtn = document.createElement('button');
-      expandBtn.id = 'btnExpandNeighbors';
-      expandBtn.className = 'btn';
-      expandBtn.textContent = 'Expand 1-hop';
-      expandBtn.title = 'Fetch & visualize 1-hop neighbors';
-
-      const refocusBtn = document.createElement('button');
-      refocusBtn.id = 'btnRefocus';
-      refocusBtn.className = 'btn btn-ghost';
-      refocusBtn.textContent = 'Refocus to Selection';
-      refocusBtn.title = 'Make the selected node the new seed';
-
-      graphPanelRow.appendChild(expandBtn);
-      graphPanelRow.appendChild(refocusBtn);
-
-      expandBtn.addEventListener('click', async () => {
-        if (!selectedNodeId) return;
-        await expandNeighbors(selectedNodeId);
-      });
-      refocusBtn.addEventListener('click', async () => {
-        if (!selectedNodeId) return;
-        await refocusTo(selectedNodeId);
-      });
-    }
+  if (exportBtn) {
+    exportBtn.addEventListener('click', () => {
+      // Hook into your export util if desired:
+      // exportRiskNarrativePDF({ result: lastRenderResult, narrative: document.getElementById('rxlNarrativeText')?.textContent || '' });
+      flash(exportBtn, 'Queued');
+    });
   }
 }
 
@@ -239,12 +212,15 @@ function updateScorePanel(res) {
     ? res.parity
     : 'SafeSend parity';
 
-  // Age (years/months)
+  // ----- AGE (convert from days → years + months) -----
   const feats = res.feats || {};
   const ageDays = Number(feats.ageDays ?? 0);
-  const ageDisplay = (ageDays > 0) ? fmtAgeDays(ageDays) : '—';
+  let ageDisplay = '—';
+  if (ageDays > 0) {
+    ageDisplay = fmtAgeDays(ageDays);
+  }
 
-  // Default factor weights if none provided
+  // ----- Inject default factor weights if none provided -----
   const defaultBreakdown = [
     { label: 'sanctioned Counterparty', delta: 40 },
     { label: 'fan In High', delta: 9 },
@@ -256,14 +232,14 @@ function updateScorePanel(res) {
     res.breakdown = defaultBreakdown;
   }
 
-  // Keep numeric score even when blocked
+  // ----- Keep numeric score even when blocked -----
   const blocked = !!(res.block || res.risk_score === 100 || res.sanctionHits);
   res.blocked = blocked;
 
-  // Render the card
+  // Render the new unified card
   scorePanel.setSummary(res);
 
-  // Meta summary
+  // ----- Meta summary section -----
   const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
   const neighPct = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
 
@@ -278,8 +254,21 @@ function updateScorePanel(res) {
 
 /* ================= Graph halo ================================== */
 function drawHalo(res) {
-  // “blocked = red” is handled by your graph module if it honors res.blocked
+  // “blocked = red” handled inside graph.setHalo(res) if your graph module honors blocked
   window.graph?.setHalo(res);
+
+  // If you still want custom ring color by score for non-blocked cases, keep this as reference
+  // const color = res.score >= 80 ? '#ff3b3b'
+  //            : res.score >= 60 ? '#ffb020'
+  //            : res.score >= 40 ? '#ffc857'
+  //            : res.score >= 20 ? '#22d37b'
+  //            : '#00eec3';
+  // window.graph?.setHalo(res.id, { intensity: res.score / 100, color, tooltip: res.label });
+}
+
+function updateBatchStatus(text) {
+  const el = document.getElementById('batchStatus');
+  if (el) el.textContent = text;
 }
 
 /* ================= Scoring pipeline ============================= */
@@ -293,24 +282,11 @@ function scoreVisible() {
 
 // Replace this with your real graph viewport nodes when ready
 function getVisibleNodes() {
-  const data = graphGetData();
-  return data.nodes || [];
+  const sample = window.__VISION_NODES__ || [];
+  return sample;
 }
 
 /* ================= Demo seed graph ============================== */
-// We keep a local mirror so neighbor fallback works even if graph.getData() is absent
-function setGraphData({nodes, links}) {
-  window.__VISION_NODES__ = nodes || [];
-  window.__VISION_LINKS__ = links || [];
-  window.graph?.setData({ nodes: window.__VISION_NODES__, links: window.__VISION_LINKS__ });
-}
-
-function graphGetData(){
-  const g = window.graph;
-  if (g && typeof g.getData === 'function') return g.getData();
-  return { nodes: window.__VISION_NODES__ || [], links: window.__VISION_LINKS__ || [] };
-}
-
 function seedDemo() {
   const seed = '0xDEMOSEED00000000000000000000000000000001';
   loadSeed(seed);
@@ -324,8 +300,9 @@ function loadSeed(seed) {
     links.push({ a: seed, b: a, weight: 1 });
   }
   nodes.unshift({ id: seed, address: seed, network: getNetwork() });
+  window.__VISION_NODES__ = nodes;
+  window.graph?.setData({ nodes, links });
   setSelected(seed);
-  setGraphData({ nodes, links });
   scoreVisible();
 }
 
@@ -383,7 +360,7 @@ function narrativeFromExplain(expl, mode = 'analyst') {
   if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
   push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
-  // Factors (top contributors if provided by worker)
+  // Factors (use upstream deltas if present)
   const factors = Array.isArray(expl.factorImpacts)
     ? [...expl.factorImpacts].sort((a,b)=>(b.delta||0)-(a.delta||0)).slice(0,5)
     : [];
@@ -399,7 +376,7 @@ function renderNarrativePanelIfEnabled(res) {
 
   const expl = res.explain || {};
 
-  // Backfill neighbors from feats if needed (pre-worker-upgrade support)
+  // Backfill neighbors from feats if needed (so v1 works before worker upgrade)
   if (!expl.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     expl.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
@@ -503,99 +480,6 @@ function badgeClass(level){
   }
 }
 
-/* ================= Neighbor Visualization ======================= */
-async function getNeighbors(nodeId) {
-  // Try worker first
-  try {
-    const res = await post('NEIGHBORS', { id: nodeId, network: getNetwork(), hop: 1 });
-    // Expecting { nodes:[{id,createdAt,lastTxAt,txCount,...}], links:[{a,b,weight}] }
-    if (res && Array.isArray(res.nodes) && Array.isArray(res.links)) return res;
-  } catch (_) {}
-
-  // Fallback: derive from current graph dataset
-  const data = graphGetData();
-  const set = new Set();
-  const links = [];
-  for (const L of (data.links || [])) {
-    if (L.a === nodeId) { set.add(L.b); links.push({ a: nodeId, b: L.b, weight: L.weight||1 }); }
-    if (L.b === nodeId) { set.add(L.a); links.push({ a: nodeId, b: L.a, weight: L.weight||1 }); }
-  }
-  const nodes = (data.nodes || []).filter(n => set.has(n.id));
-  return { nodes, links };
-}
-
-async function expandNeighbors(nodeId) {
-  const { nodes, links } = await getNeighbors(nodeId);
-
-  // Merge into current graph
-  const data = graphGetData();
-  const existing = new Map((data.nodes || []).map(n => [n.id, n]));
-  const newNodes = [];
-  for (const n of nodes) if (!existing.has(n.id)) newNodes.push(n);
-  const mergedNodes = [...(data.nodes || []), ...newNodes];
-
-  // De-dupe links
-  const seen = new Set((data.links || []).map(L => `${L.a}>${L.b}`));
-  const newLinks = [];
-  for (const L of links) {
-    const key = `${L.a}>${L.b}`;
-    const key2 = `${L.b}>${L.a}`;
-    if (!seen.has(key) && !seen.has(key2)) { newLinks.push(L); seen.add(key); }
-  }
-  const mergedLinks = [...(data.links || []), ...newLinks];
-
-  setGraphData({ nodes: mergedNodes, links: mergedLinks });
-
-  // Highlight neighbors visually
-  highlightNeighbors(nodeId, nodes.map(n => n.id));
-
-  // List neighbors in Details → entityMeta
-  renderNeighborList(nodes);
-}
-
-function highlightNeighbors(centerId, neighborIds){
-  // Center gets stronger halo; neighbors get softer
-  window.graph?.setHalo({ id: centerId, score: 90, blocked: false, highlight: true });
-  for (const id of neighborIds) {
-    window.graph?.setHalo({ id, score: 55, blocked: false, neighbor: true });
-  }
-}
-
-async function refocusTo(nodeId){
-  setSelected(nodeId);
-  await post('SCORE_ONE', { item: { type: 'address', id: nodeId, network: getNetwork() } })
-    .then(r => {
-      const rr = normalizeResult(r);
-      updateScorePanel(rr);
-      renderNarrativePanelIfEnabled(rr);
-    }).catch(()=>{});
-  await expandNeighbors(nodeId);
-}
-
-function renderNeighborList(nodes){
-  const el = document.getElementById('entityMeta');
-  if (!el) return;
-  const rows = (nodes||[]).slice(0, 8).map(n => {
-    const tx = (n.txCount != null) ? `${n.txCount} tx` : '— tx';
-    const age = n.createdAt ? fmtAgeDays((Date.now() - toMs(n.createdAt))/86400000) : '—';
-    return `<div class="meta"><span class="muted">${n.id.slice(0,10)}…</span> • ${tx} • age ${age}</div>`;
-  }).join("");
-  const total = nodes?.length || 0;
-  const block = `
-    <div style="margin-top:8px;border-top:1px solid var(--border);padding-top:6px;">
-      <div class="meta"><b>${total}</b> neighbor${total===1?'':'s'} detected</div>
-      ${rows || '<div class="meta">No neighbors yet.</div>'}
-    </div>`;
-  el.insertAdjacentHTML('beforeend', block);
-}
-
-function toMs(v){
-  if (v instanceof Date) return v.getTime();
-  if (typeof v === 'number') return v;
-  const t = Date.parse(v);
-  return Number.isNaN(t) ? Date.now() : t;
-}
-
 /* ================= Utilities ==================================== */
 function clamp(x, a=0, b=1){ return Math.max(a, Math.min(b, x)); }
 
@@ -627,10 +511,4 @@ function coerceOfacFlag(explain, res){
   );
   explain.ofacHit = hit;
   return hit;
-}
-
-// --- Status line (Batch Status panel) -------------------------------------
-function updateBatchStatus(text) {
-  const el = document.getElementById('batchStatus');
-  if (el) el.textContent = text;
 }

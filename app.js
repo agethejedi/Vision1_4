@@ -1,12 +1,12 @@
-// app.js — Vision 1_4: Dynamic factors + unified visuals + interactive refresh
-// ---------------------------------------------------------------------------
+// app.js — Vision 1_4: Dynamic factors + unified visuals + neighbor expand
+// -----------------------------------------------------------------------
 import './ui/ScoreMeter.js?v=2025-11-02';     // provides window.ScoreMeter(...)
 import './graph.js?v=2025-11-02';             // provides window.graph (on/setData/setHalo)
 
 /* ================= Feature Flags ==================== */
 const RXL_FLAGS = Object.freeze({
-  enableNarrative: true,           // flip false to hide Narrative panel
-  debounceViewportMs: 200,         // rescore delay after viewport changes (if event supported)
+  enableNarrative: true,            // hide/show narrative panel
+  debounceViewportMs: 200,          // rescore delay after viewport changes
 });
 
 /* ================= Worker plumbing ================== */
@@ -35,7 +35,7 @@ worker.onmessage = (e) => {
     drawHalo(r);
     if (r.id === selectedNodeId) {
       updateScorePanel(r);
-      applyVisualCohesion(r);                 // NEW: unify ring & halo color
+      applyVisualCohesion(r);                 // keep ring + halo in sync
       renderNarrativePanelIfEnabled(r);
     }
     updateBatchStatus(`Scored: ${r.id.slice(0,8)}… → ${r.score}`);
@@ -47,7 +47,7 @@ worker.onmessage = (e) => {
     drawHalo(r);
     if (r.id === selectedNodeId) {
       updateScorePanel(r);
-      applyVisualCohesion(r);                 // NEW
+      applyVisualCohesion(r);
       renderNarrativePanelIfEnabled(r);
     }
     if (req) { req.resolve(r); pending.delete(id); }
@@ -69,22 +69,19 @@ worker.onmessage = (e) => {
 
 /* ================ Result normalization ========================== */
 function normalizeResult(res = {}) {
-  // Prefer server risk_score (100 on OFAC), else fallback to res.score
   const serverScore = (typeof res.risk_score === 'number') ? res.risk_score : null;
   const score = (serverScore != null) ? serverScore : (typeof res.score === 'number' ? res.score : 0);
 
-  // Blocked if server says block, or risk_score=100, or explicit sanction hit
   const blocked = !!(res.block || serverScore === 100 || res.sanctionHits);
 
-  // Preserve upstream explain or create a shell
   const explain = res.explain && typeof res.explain === 'object'
     ? { ...res.explain }
     : { reasons: res.reasons || res.risk_factors || [] };
 
-  // Robust OFAC boolean for UI/badges
+  // OFAC boolean for visuals + badges
   coerceOfacFlag(explain, res);
 
-  // Wallet age risk (fallback from feats.ageDays → 0..1; younger = riskier)
+  // Wallet-age risk fallback (younger → higher risk)
   if (typeof explain.walletAgeRisk !== 'number') {
     const days = Number(res.feats?.ageDays ?? NaN);
     if (!Number.isNaN(days) && days >= 0) {
@@ -92,16 +89,10 @@ function normalizeResult(res = {}) {
     }
   }
 
-  // Map any neighbor proxies if native fields absent (harmless if missing)
+  // Neighbor proxies if native explain missing
   if (!explain.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
-    explain.neighborsDormant = {
-      inactiveRatio: clamp(r),
-      avgInactiveAge: null,
-      resurrected: 0,
-      whitelistPct: 0,
-      n: null
-    };
+    explain.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
   }
   if (!explain.neighborsAvgTxCount && res.feats?.local?.neighborAvgTx != null) {
     explain.neighborsAvgTxCount = { avgTx: Number(res.feats.local.neighborAvgTx) || 0, n: null };
@@ -110,13 +101,7 @@ function normalizeResult(res = {}) {
     explain.neighborsAvgAge = { avgDays: Number(res.feats.local.neighborAvgAgeDays) || 0, n: null };
   }
 
-  return {
-    ...res,
-    score,
-    explain,
-    block: blocked,
-    blocked
-  };
+  return { ...res, score, explain, block: blocked, blocked };
 }
 
 /* ================== Init ======================================= */
@@ -127,7 +112,7 @@ async function init() {
     network: getNetwork(),
     ruleset: 'safesend-2025.10.1',
     concurrency: 8,
-    flags: { graphSignals: true, streamBatch: true, neighborStats: true } // safe if worker ignores
+    flags: { graphSignals: true, streamBatch: true, neighborStats: true }
   });
 
   bindUI();
@@ -159,7 +144,7 @@ function bindUI() {
     scoreVisible();
   });
 
-  // Graph selection → score and render (context refresh)
+  // Node selection → rescore + refresh context and expand neighbors
   window.graph?.on('selectNode', (n) => {
     if (!n) return;
     setSelected(n.id);
@@ -167,8 +152,9 @@ function bindUI() {
       .then(r => {
         const rr = normalizeResult(r);
         updateScorePanel(rr);
-        applyVisualCohesion(rr);             // NEW: unify visuals on selection
+        applyVisualCohesion(rr);
         renderNarrativePanelIfEnabled(rr);
+        expandNeighbors(n.id).catch(()=>{});
       })
       .catch(() => {});
   });
@@ -181,27 +167,21 @@ function bindUI() {
     });
   }
 
-  // Narrative UI actions (exist only if panel is present in index.html)
+  // Narrative UI actions
   const modeSel = document.getElementById('rxlMode');
-  if (modeSel) {
-    modeSel.addEventListener('change', () => {
-      if (lastRenderResult) renderNarrativePanelIfEnabled(lastRenderResult);
-    });
-  }
+  if (modeSel) modeSel.addEventListener('change', () => {
+    if (lastRenderResult) renderNarrativePanelIfEnabled(lastRenderResult);
+  });
   const copyBtn = document.getElementById('rxlCopy');
-  if (copyBtn) {
-    copyBtn.addEventListener('click', async () => {
-      const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
-      try { await navigator.clipboard.writeText(txt); flash(copyBtn, 'Copied!'); } catch {}
-    });
-  }
+  if (copyBtn) copyBtn.addEventListener('click', async () => {
+    const txt = document.getElementById('rxlNarrativeText')?.textContent || '';
+    try { await navigator.clipboard.writeText(txt); flash(copyBtn, 'Copied!'); } catch {}
+  });
   const exportBtn = document.getElementById('rxlExport');
-  if (exportBtn) {
-    exportBtn.addEventListener('click', () => {
-      // exportRiskNarrativePDF({ result: lastRenderResult, narrative: document.getElementById('rxlNarrativeText')?.textContent || '' });
-      flash(exportBtn, 'Queued');
-    });
-  }
+  if (exportBtn) exportBtn.addEventListener('click', () => {
+    // exportRiskNarrativePDF(...)
+    flash(exportBtn, 'Queued');
+  });
 }
 
 function getNetwork() {
@@ -211,7 +191,7 @@ function getNetwork() {
 let selectedNodeId = null;
 function setSelected(id) { selectedNodeId = id; }
 
-/* ================= Factor Weights + Builders ==================== */
+/* ================= Factor Weights + Builder ===================== */
 const FACTOR_WEIGHTS = {
   'OFAC': 40,
   'OFAC/sanctions list match': 40,
@@ -243,27 +223,21 @@ const scorePanel = (window.ScoreMeter && window.ScoreMeter('#scorePanel')) || {
 };
 
 function updateScorePanel(res) {
-  // Ensure SafeSend badge
-  res.parity = (typeof res.parity === 'string' || res.parity === true)
-    ? res.parity
-    : 'SafeSend parity';
+  res.parity = (typeof res.parity === 'string' || res.parity === true) ? res.parity : 'SafeSend parity';
 
-  // ---- Age (years/months) ----
   const feats = res.feats || {};
   const ageDays = Number(feats.ageDays ?? 0);
   const ageDisplay = (ageDays > 0) ? fmtAgeDays(ageDays) : '—';
 
-  // ---- Dynamic factor list (no static defaults) ----
+  // Dynamic factor list (no static defaults)
   res.breakdown = computeBreakdownFrom(res);
 
-  // ---- Keep numeric score even when blocked ----
-  const blocked = !!(res.block || res.risk_score === 100 || res.sanctionHits);
+  // Visual blocked is stricter: any OFAC/sanction signal forces red
+  const blocked = isBlockedVisual(res);
   res.blocked = blocked;
 
-  // Render the unified card
   scorePanel.setSummary(res);
 
-  // ---- Meta summary ----
   const mixerPct = Math.round((feats.mixerTaint ?? 0) * 100) + '%';
   const neighPct = Math.round((feats.local?.riskyNeighborRatio ?? 0) * 100) + '%';
 
@@ -277,33 +251,38 @@ function updateScorePanel(res) {
 }
 
 /* ================= Unified visuals (halo + ring) ================ */
+function isBlockedVisual(res){
+  return !!(res.block || res.blocked || res.risk_score === 100 ||
+            res.sanctionHits || res.explain?.ofacHit || res.ofac === true);
+}
 function colorForScore(score, blocked){
-  if (blocked) return '#ef4444';           // hard red for blocked
+  if (blocked) return '#ef4444';
   if (score >= 80) return '#ff3b3b';
   if (score >= 60) return '#ffb020';
   if (score >= 40) return '#ffc857';
   if (score >= 20) return '#22d37b';
   return '#00eec3';
 }
-
 function applyVisualCohesion(res){
-  const color = colorForScore(res.score || 0, !!res.blocked);
-  // Graph halo with intensity ~ score
+  const blocked = isBlockedVisual(res);
+  const color = colorForScore(res.score || 0, blocked);
+
   window.graph?.setHalo({
     id: res.id,
+    blocked,
     color,
+    pulse: blocked ? 'red' : 'auto',
     intensity: Math.max(0.25, (res.score||0)/100),
-    blocked: !!res.blocked
+    tooltip: res.label
   });
-  // Score ring color via CSS var on the panel root
+
   const panel = document.getElementById('scorePanel');
   if (panel) panel.style.setProperty('--ring-color', color);
 }
 
-/* ================= Graph halo (fallback) ======================== */
+/* ================= Graph halo (single source) =================== */
 function drawHalo(res) {
-  // Keep original behavior; applyVisualCohesion will override color/intensity
-  window.graph?.setHalo(res);
+  applyVisualCohesion(res);
 }
 
 /* ================= Status line (Batch Status) =================== */
@@ -321,10 +300,21 @@ function scoreVisible() {
   post('SCORE_BATCH', { items }).catch(err => console.error(err));
 }
 
-// Replace this with your real graph viewport nodes when ready
 function getVisibleNodes() {
-  const sample = window.__VISION_NODES__ || [];
-  return sample;
+  const data = graphGetData();
+  return data.nodes || [];
+}
+
+/* ================= Graph data helpers =========================== */
+function graphGetData(){
+  const g = window.graph;
+  if (g && typeof g.getData === 'function') return g.getData();
+  return { nodes: window.__VISION_NODES__ || [], links: window.__VISION_LINKS__ || [] };
+}
+function setGraphData({nodes, links}){
+  window.__VISION_NODES__ = nodes || [];
+  window.__VISION_LINKS__ = links || [];
+  window.graph?.setData({ nodes: window.__VISION_NODES__, links: window.__VISION_LINKS__ });
 }
 
 /* ================= Demo seed graph ============================== */
@@ -332,7 +322,6 @@ function seedDemo() {
   const seed = '0xDEMOSEED00000000000000000000000000000001';
   loadSeed(seed);
 }
-
 function loadSeed(seed) {
   const n = 14, nodes = [], links = [];
   for (let i = 0; i < n; i++) {
@@ -341,10 +330,39 @@ function loadSeed(seed) {
     links.push({ a: seed, b: a, weight: 1 });
   }
   nodes.unshift({ id: seed, address: seed, network: getNetwork() });
-  window.__VISION_NODES__ = nodes;
-  window.graph?.setData({ nodes, links });
   setSelected(seed);
+  setGraphData({ nodes, links });
   scoreVisible();
+}
+
+/* ================= Neighbors (fetch/merge/highlight) ============ */
+async function getNeighbors(nodeId) {
+  try {
+    const res = await post('NEIGHBORS', { id: nodeId, network: getNetwork(), hop: 1, limit: 150 });
+    if (res && Array.isArray(res.nodes) && Array.isArray(res.links)) return res;
+  } catch {}
+  return { nodes: [], links: [] };
+}
+async function expandNeighbors(nodeId){
+  const { nodes, links } = await getNeighbors(nodeId);
+  if (!nodes.length && !links.length) return;
+
+  const data = graphGetData();
+  const seenNode = new Set((data.nodes||[]).map(n=>n.id));
+  const mergedNodes = [...(data.nodes||[]), ...nodes.filter(n=>!seenNode.has(n.id))];
+
+  const seenEdge = new Set((data.links||[]).map(L=>`${L.a}>${L.b}`));
+  const newLinks = [];
+  for (const L of (links||[])) {
+    const k = `${L.a}>${L.b}`, k2=`${L.b}>${L.a}`;
+    if (!seenEdge.has(k) && !seenEdge.has(k2)) { newLinks.push(L); seenEdge.add(k); }
+  }
+  const mergedLinks = [...(data.links||[]), ...newLinks];
+
+  setGraphData({ nodes: mergedNodes, links: mergedLinks });
+
+  // Soft highlight neighbors
+  for (const n of nodes) window.graph?.setHalo({ id:n.id, color:'#22d37b', intensity:.5 });
 }
 
 /* ================= Narrative Engine v1 =========================== */
@@ -353,19 +371,16 @@ let lastRenderResult = null;
 function narrativeFromExplain(expl, mode = 'analyst') {
   const parts = [];
 
-  // Nice age for phrasing (use last render result feats if available)
   const daysForNice = typeof lastRenderResult?.feats?.ageDays === 'number'
     ? lastRenderResult.feats.ageDays : null;
   const niceAge = daysForNice != null ? fmtAgeDays(daysForNice) : null;
 
-  // Age posture
   const ageRisk = Number(expl.walletAgeRisk ?? NaN);
   if (!Number.isNaN(ageRisk)) {
     if (ageRisk >= 0.6) parts.push(niceAge ? `newly created (${niceAge})` : 'newly created');
     else if (ageRisk <= 0.2) parts.push(niceAge ? `long-standing (${niceAge})` : 'long-standing');
   }
 
-  // Dormant neighbors
   const dorm = expl.neighborsDormant || {};
   if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) {
     let bit = 'connected to multiple dormant aged wallets';
@@ -373,27 +388,21 @@ function narrativeFromExplain(expl, mode = 'analyst') {
     parts.push(bit);
   }
 
-  // High counterparty activity among neighbors
   const nc = expl.neighborsAvgTxCount || {};
   if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) {
     parts.push('in a high-volume counterparty cluster');
   }
 
-  // Mixer adjacency (if present)
   if (expl.mixerLink) parts.push('with adjacency to mixer infrastructure');
 
-  // Compose
   let text = 'This wallet is ' + (parts.length ? parts.join(', ') : 'under assessment') + '.';
   if (!expl.ofacHit) text += ' No direct OFAC link was found.';
 
-  // Consumer tone (shorter)
   if (mode === 'consumer') {
-    text = text
-      .replace('This wallet is', 'Unusual pattern: this wallet')
-      .replace(' No direct OFAC link was found.', '');
+    text = text.replace('This wallet is', 'Unusual pattern: this wallet')
+               .replace(' No direct OFAC link was found.', '');
   }
 
-  // Badges
   const badges = [];
   const push = (label, level='warn') => badges.push({ label, level });
   if (typeof dorm.inactiveRatio === 'number' && dorm.inactiveRatio >= 0.6) push('Dormant Cluster', 'risk');
@@ -401,7 +410,6 @@ function narrativeFromExplain(expl, mode = 'analyst') {
   if (typeof nc.avgTx === 'number' && nc.avgTx >= 200) push('High Counterparty Volume', 'warn');
   push(expl.ofacHit ? 'OFAC' : 'No OFAC', expl.ofacHit ? 'risk' : 'safe');
 
-  // Factors: prefer worker-provided explain factorImpacts, else none (we'll inject res.breakdown later)
   const factors = Array.isArray(expl.factorImpacts)
     ? [...expl.factorImpacts].sort((a,b)=>(b.delta||0)-(a.delta||0)).slice(0,5)
     : [];
@@ -417,7 +425,6 @@ function renderNarrativePanelIfEnabled(res) {
 
   const expl = res.explain || {};
 
-  // Backfill neighbors from feats if needed (pre-worker-upgrade support)
   if (!expl.neighborsDormant && res.feats?.local?.riskyNeighborRatio != null) {
     const r = Number(res.feats.local.riskyNeighborRatio) || 0;
     expl.neighborsDormant = { inactiveRatio: clamp(r), avgInactiveAge: null, resurrected: 0, whitelistPct: 0, n: null };
@@ -434,11 +441,8 @@ function renderNarrativePanelIfEnabled(res) {
   const mode = modeSel ? modeSel.value : 'analyst';
   let { text, badges, factors } = narrativeFromExplain(expl, mode);
 
-  // If no factors from explain, use the dynamic res.breakdown (top 5)
   if ((!factors || !factors.length) && Array.isArray(res.breakdown)) {
-    factors = res.breakdown.slice(0,5).map(x => ({
-      label: x.label, delta: x.delta, sourceKey: 'breakdown'
-    }));
+    factors = res.breakdown.slice(0,5).map(x => ({ label: x.label, delta: x.delta, sourceKey: 'breakdown' }));
   }
 
   panel.hidden = false;
@@ -511,7 +515,7 @@ function deriveMetrics(res, key){
     }
     case 'walletAgeRisk': {
       const days = typeof res.feats?.ageDays === 'number' ? res.feats.ageDays : null;
-      return days != null ? fmtAgeDays(days) : '—'; // match Details format
+      return days != null ? fmtAgeDays(days) : '—';
     }
     case 'ofacHit':
       return (res.sanctionHits || e.ofacHit) ? 'hit' : 'none';
@@ -530,7 +534,6 @@ function badgeClass(level){
 
 /* ================= Utilities ==================================== */
 function clamp(x, a=0, b=1){ return Math.max(a, Math.min(b, x)); }
-
 function fmtAgeDays(days){
   if(!(days > 0)) return '—';
   const totalMonths = Math.round(days / 30.44);
@@ -540,23 +543,14 @@ function fmtAgeDays(days){
   if (y > 0) return `${y}y`;
   return `${m}m`;
 }
-
-function flash(btn, msg){
-  const keep = btn.textContent;
-  btn.textContent = msg;
-  setTimeout(()=>btn.textContent = keep, 900);
-}
-
+function flash(btn, msg){ const keep = btn.textContent; btn.textContent = msg; setTimeout(()=>btn.textContent = keep, 900); }
 function hasReason(res, kw){
   const arr = res.reasons || res.risk_factors || [];
   const txt = Array.isArray(arr) ? JSON.stringify(arr).toLowerCase() : String(arr).toLowerCase();
   return txt.includes(kw);
 }
 function coerceOfacFlag(explain, res){
-  const hit = !!(
-    res.sanctionHits || res.sanctioned || res.ofac ||
-    hasReason(res, 'ofac') || hasReason(res, 'sanction')
-  );
+  const hit = !!(res.sanctionHits || res.sanctioned || res.ofac || hasReason(res, 'ofac') || hasReason(res, 'sanction'));
   explain.ofacHit = hit;
   return hit;
 }
